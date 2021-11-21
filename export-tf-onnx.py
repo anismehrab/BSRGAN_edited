@@ -4,13 +4,17 @@ import onnxruntime
 import numpy as np
 from onnx_tf.backend import prepare
 import torch
-from models.network_rrdbnet import RRDBNet as net
+from models.network_rrdbnet_scripted import RRDBNet as net
 import tensorflow as tf
 import time
 from torch.utils.mobile_optimizer import optimize_for_mobile
-
-
-
+from torch.backends._nnapi import prepare as nnapi_prepare
+import torch.quantization.quantize_fx as quantize_fx
+import copy
+from onnxruntime.quantization import quantize
+from onnxruntime.quantization.quant_utils import QuantizationMode
+from utils import utils_image as util
+import cv2
 
 
 
@@ -31,12 +35,14 @@ torch_model_scripted_path = os.path.join('model_zoo', 'BSRGAN_scripted.pt')
 torch_model_path = os.path.join('model_zoo', 'BSRGAN.pth') 
 torch_model_quant_path = os.path.join('model_zoo', 'BSRGAN_quant.pt') 
 torch_model_quant_scripted_path = os.path.join('model_zoo', 'BSRGAN_quant_scripted.pt') 
+torch_model_scripted_nnapi_path = os.path.join('model_zoo', 'BSRGAN_scripted_nnapi.pt') 
 torch_model_quant_scripted_vulakn_path = os.path.join('model_zoo', 'BSRGAN_quant_scripted_vulkan.pt') 
 onnx_path = os.path.join('model_zoo', 'BSRGAN_ONNX.onnx')        
-onnx_quant_path = os.path.join('model_zoo', 'BSRGAN_ONNX_scripted.onnx')        
+onnx_quant_path = os.path.join('model_zoo', 'BSRGAN_ONNX_quant.onnx')        
+onnx_quant_static_path = os.path.join('model_zoo', 'BSRGAN_ONNX_quant_static.onnx')        
 tf_rep_path = os.path.join('model_zoo', 'BSRGAN_tf_Rep')         
 tf_lite_path = os.path.join('model_zoo', 'BSRGAN_tf_Lite')         
-device = torch.device('cpu')#('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 
@@ -49,24 +55,84 @@ device = torch.device('cpu')#('cuda' if torch.cuda.is_available() else 'cpu')
 torch_model = net(in_nc=3, out_nc=3, nf=64, nb=23, gc=32, sf=4)
 torch_model.load_state_dict(torch.load(torch_model_path), strict=True)
 torch_model.eval()
-torch_model = torch_model.to(device)
 torch.cuda.empty_cache()
-
+        
+# for k, v in torch_model.named_parameters():
+#     v.requires_grad = False
+torch.cuda.empty_cache()
+torch_model = torch_model.to(device)
 
 #Post Training Static Quantization
-# backend = "qnnpack"
-# torch_model.qconfig = torch.quantization.get_default_qconfig(backend)
-# torch.backends.quantized.engine = backend
-# model_static_quantized = torch.quantization.prepare(torch_model, inplace=False)
-# model_static_quantized = torch.quantization.convert(model_static_quantized, inplace=False)
-#torch.save(model_static_quantized.state_dict(), torch_model_quant_path)
+# modules_to_fuse = [['conv1', 'bn1'],
+#                    ['layer1.0.conv1', 'layer1.0.bn1'],
+#                    ['layer1.0.conv2', 'layer1.0.bn2'],
+#                    ['layer1.1.conv1', 'layer1.1.bn1'],
+#                    ['layer1.1.conv2', 'layer1.1.bn2'],
+#                    ['layer2.0.conv1', 'layer2.0.bn1'],
+#                    ['layer2.0.conv2', 'layer2.0.bn2'],
+#                    ['layer2.0.downsample.0', 'layer2.0.downsample.1'],
+#                    ['layer2.1.conv1', 'layer2.1.bn1'],
+#                    ['layer2.1.conv2', 'layer2.1.bn2'],
+#                    ['layer3.0.conv1', 'layer3.0.bn1'],
+#                    ['layer3.0.conv2', 'layer3.0.bn2'],
+#                    ['layer3.0.downsample.0', 'layer3.0.downsample.1'],
+#                    ['layer3.1.conv1', 'layer3.1.bn1'],
+#                    ['layer3.1.conv2', 'layer3.1.bn2'],
+#                    ['layer4.0.conv1', 'layer4.0.bn1'],
+#                    ['lwith torch.no_grad():ayer4.0.conv2', 'layer4.0.bn2'],
+#                    ['layer4.0.downsample.0', 'layer4.0.downsample.1'],
+#                    ['layer4.1.conv1', 'layer4.1.bn1'],
+#                    ['layer4.1.conv2', 'layer4.1.bn2']]
+# model_f32_fused = torch.quantization.fuse_modules(torch_model, modules_to_fuse)
+torch_model.qconfig = torch.quantization.get_default_qconfig('qnnpack')
+model_fp32_prepared =torch.quantization.prepare(torch_model)
+
+model_fp32_prepared.to(device)
+L_path = os.path.join("testsets", 'RealSRSet')
+with torch.no_grad():
+    for img in util.get_image_paths(L_path):
+        
+
+        img_L = util.imread_uint(img, n_channels=3)#return numpy array RGB H*W*C
+        if(np.shape(img_L)[0] < 550 and np.shape(img_L)[1] < 550):
+            img_L = util.uint2tensor4(img_L)#return pytorch tensor with 1*C*H*W
+            
+            img_L = img_L.to(device)
+            model_fp32_prepared(img_L)
+            torch.cuda.empty_cache()
+            
+model_fp32_prepared.cpu()
+model_int8_quantized =torch.quantization.convert(model_fp32_prepared)
+torch.save(model_int8_quantized.state_dict(), torch_model_quant_path)
+# img_E = util.tensor2uint(model_int8_quantized(img_L))
+# cv2.imshow(img_E)
+# quantized_MODEL = torch.quantization.quantize_dynamic(
+#     torch_model, {torch.nn.Conv2d, torch.nn.Linear}, dtype=torch.qint8
+# )
+
+# #dynamic/weight_only Quantization
+# model_to_quantize = copy.deepcopy(torch_model)
+# model_to_quantize.eval()
+# qconfig_dict = {"": torch.quantization.default_dynamic_qconfig}
+# # prepare
+# model_prepared = quantize_fx.prepare_fx(model_to_quantize, qconfig_dict)
+# # no calibration needed when we only have dynamici/weight_only quantization
+# # quantize
+# model_quantized = quantize_fx.convert_fx(model_prepared)
+
 
 #TORCHSCRIPT
-scripted_model = torch.jit.script(torch_model)
-scripted_model_optimized = optimize_for_mobile(scripted_model,backend='cpu')
-scripted_model_optimized._save_for_lite_interpreter(torch_model_scripted_path)
+scripted_model = torch.jit.script(model_int8_quantized)
+scripted_model_optimized = optimize_for_mobile(scripted_model,backend="cpu")
+scripted_model_optimized._save_for_lite_interpreter(torch_model_quant_scripted_path)
+scripted_model_optimized = optimize_for_mobile(scripted_model,backend="vulkan")
+scripted_model_optimized._save_for_lite_interpreter(torch_model_quant_scripted_vulakn_path)
 
-
+# #to NNAPI 
+# scripted_model = torch.jit.script(torch_model)
+# input_tensor = torch.from_numpy(np.random.randn(1, 3, 50, 50).astype(np.float32))
+# nnapi_model = nnapi_prepare.convert_model_to_nnapi(scripted_model,input_tensor)
+# nnapi_model._save_for_lite_interpreter(torch_model_scripted_nnapi_path)
 #TORCH TO ONNX
 
 # def exportToOnnx(model,input,output,path):
@@ -89,9 +155,9 @@ scripted_model_optimized._save_for_lite_interpreter(torch_model_scripted_path)
 #     print("finished exporting to onnx")
 
 # print("mode loaded to {}".format(device))
-# img_L = torch.from_numpy(np.random.randn(1, 3, 50, 50).astype(np.float32))
-# img_E = torch_model(img_L.to(device))
-# exportToOnnx(model = torch_model,input = img_L,output = img_E,path = onnx_path)
+# img_L = torch.from_numpy(np.random.randn(1, 3, 50, 50).astype(np.uint8))
+# img_E = torch.from_numpy(np.random.randn(1, 3, 200, 200).astype(np.uint8))
+# exportToOnnx(model = model_quantized,input = img_L,output = img_E,path = onnx_path)
 
 
 
@@ -100,13 +166,19 @@ scripted_model_optimized._save_for_lite_interpreter(torch_model_scripted_path)
 # # Load the ONNX model
 # model_onnx = onnx.load(onnx_path)
 
-# #Check that the IR is well formed
-# onnx.checker.check_model(model_onnx)
+# # #Check that the IR is well formed
+# # onnx.checker.check_model(model_onnx)
+# # #Print a Human readable representation of the graph
+# # print(onnx.helper.printable_graph(model_onnx.graph))
+# quantized_model = quantize(model_onnx,
+#                             quantization_mode=QuantizationMode.IntegerOps,
+#                             symmetric_weight=True,
+#                             force_fusions=True)
 
-# #Print a Human readable representation of the graph
-# print(onnx.helper.printable_graph(model_onnx.graph))
+# onnx.save(quantized_model, onnx_quant_path)
 
-# ort_session = onnxruntime.InferenceSession(onnx_path)
+
+# ort_session = onnxruntime.InferenceSession(onnx_quant_path)
 
 # outputs = ort_session.run(
 #     None,
@@ -116,7 +188,8 @@ scripted_model_optimized._save_for_lite_interpreter(torch_model_scripted_path)
 
 
 
-# #ONNX to TF
+#ONNX to TF
+# model_onnx = onnx.load(onnx_quant_path)
 # tf_rep = prepare(model_onnx)    
 # tf_rep.export_graph(tf_rep_path)
 
@@ -126,15 +199,15 @@ scripted_model_optimized._save_for_lite_interpreter(torch_model_scripted_path)
 # model_tf = tf.saved_model.load(tf_rep_path)
 # model_tf.trainable = False
 
-# # input_tensor = tf.random.uniform([1, 3, 40, 40])
-# # out = model_tf(**{'input': input_tensor})
-# # print(out["output"].shape)
+# input_tensor = tf.random.uniform([1, 3, 40, 40])
+# out = model_tf(**{'input': input_tensor})
+# print(out["output"].shape)
 
 
 
 
-# #TF to TFLite
-# # Convert the model
+#TF to TFLite
+# Convert the model
 # converter = tf.lite.TFLiteConverter.from_saved_model(tf_rep_path)
 # tflite_model = converter.convert()
 
@@ -149,10 +222,10 @@ scripted_model_optimized._save_for_lite_interpreter(torch_model_scripted_path)
 # converter.optimizations = [tf.lite.Optimize.DEFAULT]
 # #Convert using integer-only quantization
 # #Ensure that if any ops can't be quantized, the converter throws an error
-# converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-# # Set the input and output tensors to uint8 (APIs added in r2.3)
-# converter.inference_input_type = tf.uint8
-# converter.inference_output_type = tf.uint8
+# # converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+# # # Set the input and output tensors to uint8 (APIs added in r2.3)
+# # converter.inference_input_type = tf.uint8
+# # converter.inference_output_type = tf.uint8
 # tflite_quant_model = converter.convert()
 # # Save the quantizated model
 # with open(tf_lite_path+"_quant.tflite", 'wb') as f:

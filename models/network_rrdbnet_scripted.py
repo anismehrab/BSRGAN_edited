@@ -74,6 +74,10 @@ class RRDB(nn.Module):
 class RRDBNet(nn.Module):
     def __init__(self, in_nc=3, out_nc=3, nf=64, nb=23, gc=32, sf=4):
         super(RRDBNet, self).__init__()
+
+         # QuantStub converts tensors from floating point to quantized
+        self.quant = torch.quantization.QuantStub()
+
         RRDB_block_f = functools.partial(RRDB, nf=nf, gc=gc)
         self.sf = sf
         print([in_nc, out_nc, nf, nb, gc, sf])
@@ -90,14 +94,19 @@ class RRDBNet(nn.Module):
 
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
+         # DeQuantStub converts tensors from quantized to floating point
+        self.dequant = torch.quantization.DeQuantStub()
     def forward(self, x):
+        x = self.quant(x)
         fea = self.conv_first(x)
         trunk = self.trunk_conv(self.RRDB_trunk(fea))
         fea = fea + trunk
 
-        fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=float(2), mode='nearest')))
         if self.sf==4:
-            fea = self.lrelu(self.upconv2(F.interpolate(fea, scale_factor=2, mode='nearest')))
+            fea = self.lrelu(self.upconv2(F.interpolate(fea, scale_factor=float(2), mode='nearest')))
         out = self.conv_last(self.lrelu(self.HRconv(fea)))
-
+        # manually specify where tensors will be converted from quantized
+        # to floating point in the quantized model
+        out = self.dequant(out)
         return out
