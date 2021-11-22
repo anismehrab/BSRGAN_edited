@@ -36,6 +36,7 @@ class ResidualDenseBlock_5C(nn.Module):
     def __init__(self, nf=64, gc=32, bias=True):
         super(ResidualDenseBlock_5C, self).__init__()
         # gc: growth channel, i.e. intermediate channels
+        self.ff = nn.quantized.FloatFunctional()
         self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1, bias=bias)
         self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1, bias=bias)
         self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1, bias=bias)
@@ -52,7 +53,9 @@ class ResidualDenseBlock_5C(nn.Module):
         x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
         x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
         x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
-        return x5 * 0.2 + x
+        x6 = self.ff.mul_scalar(x5 , 0.2)
+        x7 = self.ff.add(x6, x)
+        return x7
 
 
 class RRDB(nn.Module):
@@ -60,6 +63,7 @@ class RRDB(nn.Module):
 
     def __init__(self, nf, gc=32):
         super(RRDB, self).__init__()
+        self.ff = nn.quantized.FloatFunctional()
         self.RDB1 = ResidualDenseBlock_5C(nf, gc)
         self.RDB2 = ResidualDenseBlock_5C(nf, gc)
         self.RDB3 = ResidualDenseBlock_5C(nf, gc)
@@ -68,7 +72,9 @@ class RRDB(nn.Module):
         out = self.RDB1(x)
         out = self.RDB2(out)
         out = self.RDB3(out)
-        return out * 0.2 + x
+        out = self.ff.mul_scalar(out, 0.2)
+        out = self.ff.add(out, x)
+        return out
 
 
 class RRDBNet(nn.Module):
@@ -93,14 +99,14 @@ class RRDBNet(nn.Module):
         self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True)
 
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-
+        self.ff = torch.nn.quantized.FloatFunctional()
          # DeQuantStub converts tensors from quantized to floating point
         self.dequant = torch.quantization.DeQuantStub()
     def forward(self, x):
         x = self.quant(x)
         fea = self.conv_first(x)
         trunk = self.trunk_conv(self.RRDB_trunk(fea))
-        fea = fea + trunk
+        fea = self.ff.add(fea , trunk)
 
         fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=float(2), mode='nearest')))
         if self.sf==4:

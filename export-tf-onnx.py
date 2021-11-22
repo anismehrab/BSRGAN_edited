@@ -1,18 +1,21 @@
-import onnx
+# import onnx
+# import onnxruntime
+# from onnx_tf.backend import prepare
+# from onnxruntime.quantization import quantize
+# from onnxruntime.quantization.quant_utils import QuantizationMode
+
+# import tensorflow as tf
+
 import os
-import onnxruntime
 import numpy as np
-from onnx_tf.backend import prepare
 import torch
 from models.network_rrdbnet_scripted import RRDBNet as net
-import tensorflow as tf
 import time
 from torch.utils.mobile_optimizer import optimize_for_mobile
 from torch.backends._nnapi import prepare as nnapi_prepare
 import torch.quantization.quantize_fx as quantize_fx
 import copy
-from onnxruntime.quantization import quantize
-from onnxruntime.quantization.quant_utils import QuantizationMode
+
 from utils import utils_image as util
 import cv2
 
@@ -53,59 +56,80 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 #LOAD TORCH MODEL
 torch_model = net(in_nc=3, out_nc=3, nf=64, nb=23, gc=32, sf=4)
-torch_model.load_state_dict(torch.load(torch_model_path), strict=True)
+torch_model.load_state_dict(torch.load(torch_model_path))
 torch_model.eval()
-torch.cuda.empty_cache()
-        
-# for k, v in torch_model.named_parameters():
-#     v.requires_grad = False
-torch.cuda.empty_cache()
-torch_model = torch_model.to(device)
+#torch_model = torch_model.to(device)
 
 #Post Training Static Quantization
-# modules_to_fuse = [['conv1', 'bn1'],
-#                    ['layer1.0.conv1', 'layer1.0.bn1'],
-#                    ['layer1.0.conv2', 'layer1.0.bn2'],
-#                    ['layer1.1.conv1', 'layer1.1.bn1'],
-#                    ['layer1.1.conv2', 'layer1.1.bn2'],
-#                    ['layer2.0.conv1', 'layer2.0.bn1'],
-#                    ['layer2.0.conv2', 'layer2.0.bn2'],
-#                    ['layer2.0.downsample.0', 'layer2.0.downsample.1'],
-#                    ['layer2.1.conv1', 'layer2.1.bn1'],
-#                    ['layer2.1.conv2', 'layer2.1.bn2'],
-#                    ['layer3.0.conv1', 'layer3.0.bn1'],
-#                    ['layer3.0.conv2', 'layer3.0.bn2'],
-#                    ['layer3.0.downsample.0', 'layer3.0.downsample.1'],
-#                    ['layer3.1.conv1', 'layer3.1.bn1'],
-#                    ['layer3.1.conv2', 'layer3.1.bn2'],
-#                    ['layer4.0.conv1', 'layer4.0.bn1'],
-#                    ['lwith torch.no_grad():ayer4.0.conv2', 'layer4.0.bn2'],
-#                    ['layer4.0.downsample.0', 'layer4.0.downsample.1'],
-#                    ['layer4.1.conv1', 'layer4.1.bn1'],
-#                    ['layer4.1.conv2', 'layer4.1.bn2']]
-# model_f32_fused = torch.quantization.fuse_modules(torch_model, modules_to_fuse)
+# modules_to_fuse = [['upconv1', 'lrelu'],
+#                    ['upconv2', 'lrelu'],
+#                     ['HRconv', 'lrelu'],
+#                  ]
+# model_f32_fused = torch.quantization.fuse_modules(torch_model, modules_to_fuse, inplace=True)
 torch_model.qconfig = torch.quantization.get_default_qconfig('qnnpack')
 model_fp32_prepared =torch.quantization.prepare(torch_model)
 
 model_fp32_prepared.to(device)
 L_path = os.path.join("testsets", 'RealSRSet')
+
 with torch.no_grad():
     for img in util.get_image_paths(L_path):
-        
+        torch.cuda.empty_cache()
 
         img_L = util.imread_uint(img, n_channels=3)#return numpy array RGB H*W*C
-        if(np.shape(img_L)[0] < 550 and np.shape(img_L)[1] < 550):
+        if(np.shape(img_L)[0] < 512 and np.shape(img_L)[1] < 512):
             img_L = util.uint2tensor4(img_L)#return pytorch tensor with 1*C*H*W
             
             img_L = img_L.to(device)
             model_fp32_prepared(img_L)
-            torch.cuda.empty_cache()
             
-model_fp32_prepared.cpu()
+            
+        
+model_fp32_prepared.eval()    
+model_fp32_prepared.cpu()        
 model_int8_quantized =torch.quantization.convert(model_fp32_prepared)
+input_tensor = torch.from_numpy(np.random.randn(1, 3, 50, 50).astype(np.float32))
+print(model_int8_quantized(input_tensor))
 torch.save(model_int8_quantized.state_dict(), torch_model_quant_path)
-# img_E = util.tensor2uint(model_int8_quantized(img_L))
-# cv2.imshow(img_E)
+
+
+
+
+
+
+
+
+
+
+
+
+#FX Graph Mode Quantization
+# torch_model.to(device)
+# model_to_quantize = copy.deepcopy(torch_model)
+# qconfig_dict = {"": torch.quantization.get_default_qconfig('qnnpack')}
+# model_to_quantize.eval()
+# # prepare
+# model_prepared = quantize_fx.prepare_fx(model_to_quantize, qconfig_dict)
+# # calibrate (not shown)
+# model_prepared.to(device)
+# L_path = os.path.join("testsets", 'RealSRSet')
+
+# with torch.no_grad():
+#     for img in util.get_image_paths(L_path):
+#         torch.cuda.empty_cache()
+
+#         img_L = util.imread_uint(img, n_channels=3)#return numpy array RGB H*W*C
+#         if(np.shape(img_L)[0] < 512 and np.shape(img_L)[1] < 512):
+#             img_L = util.uint2tensor4(img_L)#return pytorch tensor with 1*C*H*W
+            
+#             img_L = img_L.to(device)
+#             model_prepared(img_L)
+#             torch.cuda.empty_cache()
+# # quantize
+# model_quantized = quantize_fx.convert_fx(model_prepared)
+# input_tensor = torch.from_numpy(np.random.randn(1, 3, 50, 50).astype(np.float32))
+# print(model_quantized(input_tensor))
+# torch.save(model_quantized.state_dict(), torch_model_quant_path)
 # quantized_MODEL = torch.quantization.quantize_dynamic(
 #     torch_model, {torch.nn.Conv2d, torch.nn.Linear}, dtype=torch.qint8
 # )
@@ -125,12 +149,14 @@ torch.save(model_int8_quantized.state_dict(), torch_model_quant_path)
 scripted_model = torch.jit.script(model_int8_quantized)
 scripted_model_optimized = optimize_for_mobile(scripted_model,backend="cpu")
 scripted_model_optimized._save_for_lite_interpreter(torch_model_quant_scripted_path)
-scripted_model_optimized = optimize_for_mobile(scripted_model,backend="vulkan")
+scripted_model_optimized = optimize_for_mobile(scripted_model,backend="Vulkan")
 scripted_model_optimized._save_for_lite_interpreter(torch_model_quant_scripted_vulakn_path)
 
 # #to NNAPI 
-# scripted_model = torch.jit.script(torch_model)
+# scripted_model = torch.jit.script(model_int8_quantized)
 # input_tensor = torch.from_numpy(np.random.randn(1, 3, 50, 50).astype(np.float32))
+# input_tensor = input_tensor.contiguous(memory_format=torch.channels_last)
+# input_tensor.nnapi_nhwc = True
 # nnapi_model = nnapi_prepare.convert_model_to_nnapi(scripted_model,input_tensor)
 # nnapi_model._save_for_lite_interpreter(torch_model_scripted_nnapi_path)
 #TORCH TO ONNX
